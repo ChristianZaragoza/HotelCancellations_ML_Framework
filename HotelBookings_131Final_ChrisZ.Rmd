@@ -1,0 +1,735 @@
+---
+title: "Predicting Hotel Booking Cancellations"
+subtitle: "PSTAT 131/231 Final Project"
+author: "Chris Zaragoza Perm: A1A0T32"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r packages}
+library(tidymodels)
+library(tidyverse)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(ranger)     # random forest engine
+library(xgboost)    # boosted tree engine
+library(glmnet)     # elastic net engine
+library(vip)        # variable importance plots
+tidymodels_prefer()
+set.seed(1234)
+```
+
+------------------------------------------------------------------------
+
+# Introduction
+
+The mainline project outcome is to build a machine learning model that can accurately predict whether a hotel booking should be flagged for a potential cancellation or not. Using only the data that was available through the Kaggle data set. The process of booking and getting to a hotel has a lot of outside variables, from last minute family emergencies, to simply missing the deadline on dates. Plans can change at any given notice especially when considering the randomness that is human error. For anyone booking the hotel its a matter of simply cancelling in advance, for the ones running hotels that's a loss of bossiness from the potential of another customer that could have used that room. In generally its good practice for hotels to never face overbooking or under booking which can be both hazardous and bad for business, thus is the point in question for this research project.
+
+## Why Predicting Cancellations Matters
+
+A reliable predictive model would let a hotel move beyond broad historical averages and assess the cancellation risk of each individual reservation, opening the door to smarter overbooking, targeted retention offers, and more accurate revenue forecasting.
+
+## Vocabulary
+
+[L**ead time**]{.underline} : the number of days between when the reservation was made and the guest's scheduled arrival.
+
+[A**verage Daily Rate (ADR)**]{.underline} **:** the average price paid per occupied room per night, and is a standard measure of pricing in the hospitality industry.
+
+[**Cancellation Rate**]{.underline} : the proportion of bookings that were ultimately canceled.
+
+Since the goal is to identify two groups, cancellations and non-cancellations, this is a [**binary classification**]{.underline} problem.
+
+## The Data set
+
+The data for this project come from the **Hotel Booking Demand** dataset, originally published by Antonio, Almeida, and Nunes (2019) and made publicly available on Kaggle. The data were drawn directly from the property management systems of two real hotels in Portugal ( one **city hotel** and one **resort hotel)** and cover bookings with arrival dates between July 2015 and August 2017.\
+Because the records come from actual hotel operations rather than a simulation, they carry all the messiness of real world data: missing fields, extreme outliers, and irregular booking behavior. All personally identifying information was removed by the original authors before publication.\
+\
+One thing of note is that these hotel stats are over 9 years old and may not reflect the economic context and demand of current markets as of 2026 and also setting which takes place in Portugal. However working with the set may at least give insight to data from other hotels from similar context and also help gain a general understanding of the demographic of hotel customers, to a certain extent.
+
+In total, the dataset contains **119,390 bookings** described by **32 variables**. One of these, `is_canceled`, the yield;
+
+The remaining 31 serve as potential predictors.\
+These predictors span a wide range of information: including how far in advance the booking was made (`lead_time`), the type of hotel (`hotel`), the number and composition of guests (`adults`, `children`, `babies`), the booking's origin (`market_segment`, `distribution_channel`), the guest's history (`previous_cancellations`, `is_repeated_guest`), the room and pricing details (`reserved_room_type`, `adr`, `deposit_type`), and more. The variables are a mix of numeric types (such as `lead_time` and `adr`) and categorical types (such as `hotel` and `deposit_type`), which means the preparation will need to handle both types propelling.
+
+## Question
+
+The central question this project asks is: **using only the information known at the time of booking, can we accurately predict whether a given reservation will be canceled?** Our response variable is `is_canceled`, a binary indicator equal to 1 if the booking was canceled and 0 otherwise. In this dataset, roughly **37% of all bookings were canceled**, a substantial share that makes the prediction meaningful.
+
+Alongside the main predictive question, we are also interested in a more interpretive one: *which factors matter most* in driving cancellations? Based on domain knowledge, we suspect that variables such as lead time, deposit type, and a guest's prior cancellation history will be especially informative, and part of our analysis will be checking whether the data bear this out. The overarching goal of the model is primarily **predictive** we want accurate predictions of cancellation risk but it carries an **inferential** dimension as well, since understanding the drivers of cancellation is also valuable to a hotel deciding how to act on those predictions.
+
+------------------------------------------------------------------------
+
+# Data Citation
+
+Antonio, N., Almeida, A., & Nunes, L. (2019). Hotel booking demand datasets. *Data in Brief*, 22, 41–49. <https://doi.org/10.1016/j.dib.2018.11.126>
+
+Mostipak, J. (2020). *Hotel booking demand* [Dataset]. Kaggle. <https://www.kaggle.com/datasets/jessemostipak/hotel-booking-demand>
+
+------------------------------------------------------------------------
+
+# Exploratory Data Analysis
+
+Before fitting any models, we explore the data to understand its structure, identify any quality issues, and develop insight about which variables might help predict cancellations.
+
+## Loading the Data
+
+```{r load-data}
+hotel <- hotel <- read_csv("data/hotel_bookings.csv", na = c("", "NA", "NULL"))
+dim(hotel)
+glimpse(hotel)
+```
+
+## Tidying the Data
+
+### Removing Leakage Variables
+
+Before exploring relationships, we must address a subtle but critical problem called **data leakage**. Data leakage occurs when a predictor variable contains information that would not actually be available at the time we want to make a prediction, giving the model a "peek" at the answer and thus lead to overfitting.
+
+Two variables in this data set are leakage variables.\
+The `reservation_status` column records the final outcome of the booking ("Canceled," "Check-Out," or "No-Show"), which is essentially the outcome to predict.
+
+The `reservation_status_date` column records the date that status was assigned. Both are determined *after* the booking concludes, so we remove them before any modeling.
+
+```{r remove-leakage}
+hotel <- hotel %>%
+  select(-reservation_status, -reservation_status_date)
+```
+
+### Handling Missing Data
+
+Next, we examine the dataset for missing values, which can cause problems for many machine learning algorithms if left unaddressed.
+
+```{r}
+library(naniar)
+
+
+hotel %>%
+  slice_sample(n = 10000) %>%
+  vis_miss()
+
+# Exact numbers: missing count and percent per variable
+miss_var_summary(hotel)
+```
+
+```{r missing-data}
+hotel %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  mutate(pct_missing = round(n_missing / nrow(hotel) * 100, 2)) %>%
+  arrange(desc(n_missing)) %>%
+  kable(caption = "Variables Containing Missing Values") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+Only four variables contain missing values, and they differ in severity. The `company` variable is missing in over 94% of observations, so much so that imputing it would be meaningless, so we drop it entirely.
+
+The `agent` variable (the travel agency ID associated with the booking) is missing in about 13.7% of cases; rather than discard these rows, they are relabeld with `0` and treating them as its own category representing direct bookings.
+
+The `country` variable is missing in only 0.41% of rows, which we recode to an explicit `"Unknown"` category.
+
+Finally, `children` is missing in just 4 rows, which we fill with `0` under the reasonable assumption that a blank entry means no children were present.
+
+Aside from these four variables, the dataset has no other missing values.
+
+```{r clean-missing}
+hotel <- hotel %>%
+  select(-company) %>%                       # >94% missing; drop entirely
+  mutate(
+    agent    = replace_na(agent, 0),          # missing agent = direct booking
+    country  = replace_na(country, "Unknown"),
+    children = replace_na(children, 0)
+  )
+
+# Confirm no missing values remain
+cat("Total missing values after cleaning:", sum(is.na(hotel)), "\n")
+```
+
+During exploration the average daily rate (`adr`), the price paid per room per night. A quick numeric summary and a look at the most extreme values reveals two extreme entries:
+
+One negative rate and one extreme outlier far above any realistic nightly price.
+
+These were treated as data-entry errors and were removed.
+
+```{r adr-detect}
+# Numeric summary reveals the implausible min and max
+summary(hotel$adr)
+
+# Show the offending rows in full
+hotel %>%
+  filter(adr < 0 | adr > 1000) %>%
+  select(hotel, adr, lead_time, arrival_date_year, market_segment)
+```
+
+```{r adr-remove}
+# Remove the two implausible rows
+hotel <- hotel %>%
+  filter(adr >= 0, adr < 1000)
+```
+
+After filtering, the distribution of `adr` is clean: nearly all bookings fall between 0 and roughly 300 per night, with a right tail of higher priced rooms. The small spike at exactly 0 corresponds to complementary or comped stays, which are legitimate bookings rather than errors, so we retain them.
+
+```{r adr-confirm}
+hotel %>%
+  ggplot(aes(x = adr)) +
+  geom_histogram(bins = 100, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of ADR After Removing Outliers",
+       x = "Average Daily Rate", y = "Count")
+```
+
+### Converting Variable Types
+
+There are multiple variables stored as plain text or integers but are essentially **categorical**. They represent discrete observations instead of continuous quantities. We convert these to factors so that R and our modeling recipe treat them correctly. Most importantly, we convert our outcome `is_canceled` from a 0/1 integer into a labeled factor, which is required for classification models.
+
+```{r factor-conversion}
+hotel <- hotel %>%
+  mutate(
+    is_canceled          = factor(is_canceled, levels = c(0, 1),
+                                  labels = c("Not Canceled", "Canceled")),
+    hotel                = factor(hotel),
+    meal                 = factor(meal),
+    market_segment       = factor(market_segment),
+    distribution_channel = factor(distribution_channel),
+    reserved_room_type   = factor(reserved_room_type),
+    assigned_room_type   = factor(assigned_room_type),
+    deposit_type         = factor(deposit_type),
+    customer_type        = factor(customer_type),
+    is_repeated_guest    = factor(is_repeated_guest),
+    arrival_date_month   = factor(arrival_date_month, levels = month.name)
+  )
+```
+
+## Visualizations
+
+With the data cleaned, we now explore the relationships between our predictors and the outcome.
+
+### Distribution of the Outcome Variable
+
+We begin with a look at the target variable to see what fraction of bookings were actually cancelled from the data set in question.?
+
+```{r plot-outcome}
+hotel %>%
+  count(is_canceled) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = is_canceled, y = pct, fill = is_canceled)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(pct, 1), "%")), vjust = -0.5, size = 4.5) +
+  scale_fill_manual(values = c("#2E86AB", "#E84855")) +
+  labs(title = "Distribution of the Outcome Variable",
+       x = NULL, y = "Percentage of Bookings (%)") +
+  ylim(0, 70) +
+  theme_minimal()
+```
+
+About **37% of all bookings were cancelled**, while 63% were honored. This tells us we are working with a moderately imbalanced dataset.
+
+Cancellations are common but still the minority. This imbalance is small enough that a direct model would be appropriate but an ROC-AUC would be needed to monitor false positive and negative rates.
+
+### Cancellation Rate by Hotel Type
+
+Does the type of hotel relate to how often bookings are cancelled?
+
+```{r plot-hotel-type}
+hotel %>%
+  count(hotel, is_canceled) %>%
+  group_by(hotel) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = hotel, y = pct, fill = is_canceled)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = paste0(round(pct, 1), "%")),
+            position = position_dodge(0.6), vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = c("#2E86AB", "#E84855"), name = "Status") +
+  labs(title = "Cancellation Rate by Hotel Type",
+       x = "Hotel Type", y = "Percentage (%)") +
+  theme_minimal()
+```
+
+There is a clear difference between the two hotel types. The **city hotel has a cancellation rate of about 42%, compared to only about 28% for the resort hotel**. This makes intuitive sense: resort stays tend to be planned vacations so travelers are more committed to them. Hotel type looks like a useful predictor.
+
+### Lead Time by Cancellation Status
+
+Lead time measures how many days in advance a booking was made. We hypothesize that bookings made far ahead of time are more likely to be cancelled, since plans have more opportunity to change.
+
+```{r plot-lead-time}
+# Claude: What are multiple ways I can dispaly a distributions of historgrams that can compare two outcomes of one variable in R?
+hotel %>%
+  filter(lead_time < 500) %>%   # trim a few extreme values for readability
+  ggplot(aes(x = lead_time, fill = is_canceled)) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("#2E86AB", "#E84855"), name = "Status") +
+  labs(title = "Lead Time Distribution by Cancellation Status",
+       x = "Lead Time (days)", y = "Count") +
+  theme_minimal()
+```
+
+The pattern strongly supports the hypothesis. Bookings made on short notice are overwhelmingly honored. The tall blue spike near zero days shows that last minute reservations are rarely cancelled.
+
+As lead time increases, the distribution shifts. Bookings made months in advance, cancellations (red) become as common as or more common than completed stays. In the underlying data, cancelled bookings have an average lead time of roughly 145 days versus about 80 days for non cancelled bookings. Lead time is likely to be one of our strongest predictors.
+
+```{r}
+# Claude Promt: How can I find the avarge of a certain variable outcome based on a binary variable like canceled and not_canceled in R?
+
+hotel %>%
+  group_by(is_canceled) %>%
+  summarise(
+    mean_lead_time   = mean(lead_time),
+    median_lead_time = median(lead_time),
+    n                = n()
+  )
+```
+
+### Cancellation Rate by Deposit Type
+
+The deposit policy attached to a booking may influence how easily a guest can walk away from it. The following are cancellation rates across the three deposit categories.
+
+```{r plot-deposit}
+hotel %>%
+  count(deposit_type, is_canceled) %>%
+  group_by(deposit_type) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = deposit_type, y = pct, fill = is_canceled)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = paste0(round(pct, 1), "%")),
+            position = position_dodge(0.6), vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = c("#2E86AB", "#E84855"), name = "Status") +
+  labs(title = "Cancellation Rate by Deposit Type",
+       x = "Deposit Type", y = "Percentage (%)") +
+  theme_minimal()
+```
+
+This plot reveals the most striking finding in the entire EDA. We might expect that requiring a non refundable deposit would discourage cancellations, however **bookings with a "Non Refund" deposit are cancelled over 99% of the time**, while "No Deposit" bookings are cancelled only about 28% of the time.
+
+This surprising relationship may suggest how the data was recorded rather than guest choice. A nonrefundable status may have been applied to bookings already flagged as cancellations or no shows. Regardless of the exact cause, `deposit_type` is an extraordinarily strong signal, and we will want to keep an eye on it during modeling.
+
+### Correlation Matrix of Numeric Predictors
+
+Finally, we examine how the numeric variables relate to one another and to the outcome using a correlation matrix.
+
+```{r plot-correlation, fig.width=9, fig.height=8}
+hotel %>%
+  mutate(is_canceled_num = as.numeric(is_canceled) - 1) %>%
+  select(where(is.numeric), -agent) %>%
+  cor(use = "complete.obs") %>%
+  corrplot(method = "color", type = "upper",
+           tl.cex = 0.7, tl.col = "black",
+           addCoef.col = "black", number.cex = 0.55,
+           mar = c(0, 0, 2, 0),
+           title = "Correlation Matrix of Numeric Predictors")
+```
+
+Most numeric predictors are only weakly correlated with one another, which is good. It means they each carry decently independent or weak correlation.
+
+A few relationships stand out: `lead_time` has the strongest positive correlation with cancellation (about +0.29), confirming what we saw in the histogram, while `total_of_special_requests` (−0.23) and `required_car_parking_spaces` (−0.20) are negatively correlated with cancellation, suggesting that guests who make special requests or reserve parking are more committed to their stay. We also see expected internal correlations, such as `stays_in_weekend_nights` with `stays_in_week_nights`. Importantly, no two predictors are so highly correlated that we need to worry about severe multicollinearity.
+
+------------------------------------------------------------------------
+
+# Model Setup
+
+## Splitting the Data
+
+Splitting the data into separate training and testing sets is standard practice in machine learning. We let our models learn patterns from the **training set** and then evaluate them on a unseen **testing set**. This gives an honest estimate of performance on new data, since a model judged only on the data it learned from may have simply memorized it rather than learning patterns that generalize. We use an **80/20 split**, which still leaves a testing set of over 23,000 bookings.
+
+We also **stratify** the split on the outcome variable, `is_canceled`, meaning we preserve the proportion of canceled bookings in both sets. Since roughly 37% of bookings were canceled, stratification ensures both sets reflect that same percentage rather than letting random chance skew one of them.
+
+```{r split}
+
+# 80/20 split, stratified on the outcome variable
+hotel_split <- initial_split(hotel, prop = 0.80, strata = is_canceled)
+
+hotel_train <- training(hotel_split)
+hotel_test  <- testing(hotel_split)
+
+# Verify the split produced the expected number of observations
+nrow(hotel_train)
+nrow(hotel_test)
+```
+
+## Building the Recipe
+
+Our recipe begins by removing a handful of predictors that are poorly suited to modeling. The `country` and `agent` variables each have hundreds of unique values; dummy encoding them directly would create an unwieldy number of columns while adding little predictive value, so we drop them. We also drop the granular date fields (`arrival_date_year`, `arrival_date_week_number`, and `arrival_date_day_of_month`), since seasonal information is already captured by `arrival_date_month`, which we keep.
+
+Next, `step_other()` groups uncommon categories of the remaining categorical variables into a single "other" level, which keeps the number of dummy variables manageable. `step_dummy()` then converts every categorical predictor into numeric indicator variables, which our models require. Finally, `step_zv()` removes any predictors left with zero variance, and `step_normalize()` centers and scales all numeric predictors so they share a common scale, a step that is essential for models like elastic net that are sensitive to the magnitude of their inputs.[^1]
+
+[^1]: Claude Prompt, What does step_normalize() and step_zv() do in in tidy models?
+
+```{r recipe}
+# Cluade prompt for a general recipe what is the syntax needed for setting up a tidymodels recipe in R, given my building the recipe statement?
+
+hotel_recipe <- recipe(is_canceled ~ ., data = hotel_train) %>%
+  # Remove high-cardinality identifiers and granular date fragments
+  # that won't generalize to new bookings
+  step_rm(country, agent,
+          arrival_date_year, arrival_date_week_number,
+          arrival_date_day_of_month) %>%
+  # Lump rare categorical levels into "other" to keep dummies manageable
+  step_other(market_segment, distribution_channel,
+             reserved_room_type, assigned_room_type,
+             threshold = 0.05) %>%
+  # Convert all categorical predictors into numeric dummy variables
+  step_dummy(all_nominal_predictors()) %>%
+  # Drop any predictors that end up with a single value
+  step_zv(all_predictors()) %>%
+  # Center and scale numeric predictors so they share a common scale
+  step_normalize(all_numeric_predictors())
+
+hotel_recipe
+```
+
+## Cross-Validation
+
+Before fitting our models, we set up **k-fold cross-validation** on the training data. The idea is to divide the training set into *k* equal groups, called folds. We then train a model *k* separate times. Each time, one fold is held out as a validation set while the model learns from the remaining k− 1 folds, and we record how well it predicts the validation fold. Averaging the performance across all k rounds gives us a more stable estimate of how the model will perform since every observation gets used for both training and validation at some point.
+
+We use **5 folds** here, and once again **stratify** on `is_canceled` so that each fold preserves the proportional 37% cancellation rate found in the full data. Going with 5 will be the smarter move on the computational side and considering the scope of the data set, this will be more than enough for modeling.
+
+```{r cv-folds}
+# 5-fold cross-validation, stratified on the outcome
+hotel_folds <- vfold_cv(hotel_train, v = 5, strata = is_canceled)
+
+hotel_folds
+
+```
+
+------------------------------------------------------------------------
+
+# Model Building
+
+With our data split, processed, and folded, they will now be fit in the models with future performance comparison. The models in question are logistic regression, elastic net, a random forest, and a boosted tree. We evaluate every model using **ROC-AUC** (the area under the ROC curve), a standard metric for binary classification. ROC-AUC measures how well a model separates the two classes across all possible decision thresholds.
+
+A score of 1.0 represents perfect separation, while 0.5 is no better than random guessing. We favor ROC-AUC over plain accuracy here because our data are moderately imbalanced with only 37% cancellations, a model could reach 63% accuracy by predicting "not canceled" every time, yet be useless.
+
+## Model 1: Logistic Regression
+
+Logistic regression estimates the probability that a booking belongs to the "Canceled" class as a function of the predictors, using a linear combination of those predictors passed through the logistic function to keep the output between 0 and 1. It has no hyperparameters to tune, which makes it an ideal **baseline**: it tells us what level of performance is achievable with a simple, interpretable model before moveing on to more flexible ones. We fit it across our cross-validation folds and record its average ROC-AUC.
+
+```{r log-reg-spec}
+# Define model spec and workflow
+log_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_wf <- workflow() %>%
+  add_model(log_spec) %>%
+  add_recipe(hotel_recipe)
+```
+
+```{r log-reg-fit, eval=FALSE}
+log_fit <- fit_resamples(
+  log_wf,
+  resamples = hotel_folds,
+  metrics   = metric_set(roc_auc),
+  control   = control_resamples(save_pred = TRUE)
+)
+
+save(log_fit, file = "log_fit.rda")
+```
+
+```{r log-reg-results}
+load("log_fit.rda")
+collect_metrics(log_fit)
+```
+
+Logistic regression achieves a strong cross-validated ROC-AUC of **0.861**, well above the 0.5 baseline of random guessing, confirming that the model is capturing genuine patterns rather than noise. The very small standard error (0.0015) shows this performance was highly consistent across all five folds, meaning our estimate is stable and not an artifact of any particular split. This sets a high bar for a baseline model likely driven in part by the powerful `deposit_type` signal we identified during EDA, and gives us a clear benchmark to measure our more flexible models against.
+
+## Model 2: Elastic Net
+
+Elastic net is a form of penalized logistic regression. It works like ordinary logistic regression but adds a penalty that shrinks the model's coefficients toward zero, which helps prevent overfitting and can perform automatic feature selection by driving some coefficients all the way to zero. It has two hyperparameters we tune.
+
+The `penalty` controls the overall strength of the regularization. The strength on how coefficients are shrunk. While the `mixture` controls the *type* of penalty, blending between ridge regression (`mixture = 0`, which shrinks coefficients but keeps them all) and LASSO (`mixture = 1`, which can zero them out entirely).
+
+Tuning both across our folds, we let cross validation find the combination that best separates canceled from non canceled bookings.
+
+```{r rf-spec}
+# Elastic net (penalized logistic regression), tuning penalty and mixture
+enet_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+enet_wf <- workflow() %>%
+  add_model(enet_spec) %>%
+  add_recipe(hotel_recipe)
+
+# Regular grid: 10 levels each, mixture from 0 to 1
+enet_grid <- grid_regular(
+  penalty(),
+  mixture(range = c(0, 1)),
+  levels = 10
+)
+```
+
+```{r rf-tune, eval=FALSE}
+
+enet_tune <- tune_grid(
+  enet_wf,
+  resamples = hotel_folds,
+  grid      = enet_grid,
+  metrics   = metric_set(roc_auc)
+)
+
+save(enet_tune, file = "enet_tune.rda")
+```
+
+```{r rf-results}
+load("enet_tune.rda")
+autoplot(enet_tune)
+show_best(enet_tune, metric = "roc_auc", n = 1)
+```
+
+The best elastic net model achieves a cross-validated ROC-AUC of **0.86071**, effectively identical to logistic regression. Notably, the optimal penalty is essentially zero (1e-10), which means the regularization was turned almost entirely off, in other words, cross-validation found that the best elastic net is one that behaves like ordinary logistic regression. This is informative as it tells us logistic model was not overfitting, so there was little for the penalty to correct. To meaningfully improve on this baseline, we will need more flexible models capable of capturing non-linear relationships.
+
+## Model 3: Random Forrest
+
+A random forest is a non-linear model and a substantial step up in flexibility. It builds a large collection of decision trees and averages their predictions. Two sources of randomness keep the trees from being too similar to one another. Each tree is trained on a different bootstrapped sample of the data, and at each split, only a random subset of predictors is considered. Averaging many such "decorrelated" trees typically produces a model that is both accurate and resistant to overfitting. We tune three hyperparameters. The `mtry` parameter sets how many predictors are randomly considered at each split; `trees` sets how many trees are grown in the forest and `min_n` sets the minimum number of observations a node must have before it can be split further, which controls how deep and detailed each tree is.
+
+```{r enet-spec}
+# Random forest, tuning mtry, trees, and min_n
+rf_spec <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(hotel_recipe)
+
+# Regular grid; mtry must stay between 1 and the number of predictors
+rf_grid <- grid_regular(
+  mtry(range = c(2, 8)),
+  trees(range = c(200, 600)),
+  min_n(range = c(5, 20)),
+  levels = 3
+)
+```
+
+```{r enet-tune, eval=FALSE}
+# Tune with tune_grid()
+# save(enet_tune, file = "results/enet_tune.rda")
+rf_tune <- tune_grid(
+  rf_wf,
+  resamples = hotel_folds,
+  grid      = rf_grid,
+  metrics   = metric_set(roc_auc)
+)
+
+save(rf_tune, file = "rf_tune.rda")
+```
+
+```{r enet-results}
+load("rf_tune.rda")
+autoplot(rf_tune)
+show_best(rf_tune, metric = "roc_auc", n = 1)
+```
+
+The random forest is our best model so far with a ROC-AUC of **0.928**. Roughly seven points above both linear models and well outside the range of the standard error. This confirms our expectation that flexible, non-linear models would better capture the structure in the data.
+
+The configuration used was `mtry = 8`, `trees = 600`, and `min_n = 5`. It is worth noting that all three of these values sat at the edge of our search grid, which suggests the model might benefit slightly from an even larger `mtry`, more trees, or deeper individual trees. However, random forest performance typically plateaus quickly in these regions, and at 0.928 the model is already performing very well, any further expansion could either lead to over fitting or take more computational power, which is not good considering this model took a while to run in the first place.
+
+## Model 4: Boosted Tree
+
+The final model is a gradient-boosted tree. Like the random forest it is built from decision trees, but instead of averaging many independent trees, boosting grows them **sequentially**, each new tree correcting the errors of the ones before it. This often yields very accurate models but can overfit if not tuned carefully.
+
+Three hyperparameters are tuned: **`trees`** (rounds of error-correction the model performs), **`tree_depth`** (complexity of each tree may), and **`learn_rate`** (how large a correction each tree contributes) For learn_rate, smaller values learn more cautiously but need more trees. We leave XGBoost's other settings at their defaults, since these three drive most of the model's performance while keeping the tuning grid tractable, its what controls "mtry", every tree had access to all the predictors.
+
+```{r boost-spec}
+# Boosted tree, tuning trees, tree_depth, and learn_rate
+boost_spec <- boost_tree(trees = tune(), tree_depth = tune(), learn_rate = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+boost_wf <- workflow() %>%
+  add_model(boost_spec) %>%
+  add_recipe(hotel_recipe)
+
+# Regular grid; learn_rate is on a log10 scale by default
+boost_grid <- grid_regular(
+  trees(range = c(200, 600)),
+  tree_depth(range = c(3, 10)),
+  learn_rate(range = c(-3, -1)),   # i.e. 0.001 to 0.1
+  levels = 4
+)
+```
+
+```{r boost-tune, eval=FALSE}
+boost_tune <- tune_grid(
+  boost_wf,
+  resamples = hotel_folds,
+  grid      = boost_grid,
+  metrics   = metric_set(roc_auc)
+)
+
+save(boost_tune, file = "boost_tune.rda")
+
+```
+
+```{r boost-results}
+load("boost_tune.rda")
+autoplot(boost_tune)
+show_best(boost_tune, metric = "roc_auc", n = 1)
+```
+
+The boosted tree achieves a ROC-AUC of **0.927**, effectively tied with the random forest and far above the linear baseline. Its optimal configuration used the maximum values searched for all three hyperparameters (`trees = 600`, `tree_depth = 10`, `learn_rate = 0.1`). These boundary values hint that a wider grid might yield marginal gains, but with performance already matching our best model, we judge further tuning to offer diminishing returns.
+
+------------------------------------------------------------------------
+
+# Model Comparison
+
+With all four models fitted and tuned, we now compare their cross-validated performance side by side. The table and plot below report each model's best ROC-AUC averaged across the five folds.
+
+```{r model-comparison}
+# claude prompt: How can Build a summary tibble to view the best ROC-AUC of out of 4 models?
+
+# best ROC-AUC from each model
+model_results <- tibble(
+  Model = c("Logistic Regression", "Elastic Net",
+            "Random Forest", "Boosted Tree"),
+  ROC_AUC = c(
+    collect_metrics(log_fit) %>% filter(.metric == "roc_auc") %>% pull(mean),
+    show_best(enet_tune,  metric = "roc_auc", n = 1) %>% pull(mean),
+    show_best(rf_tune,    metric = "roc_auc", n = 1) %>% pull(mean),
+    show_best(boost_tune, metric = "roc_auc", n = 1) %>% pull(mean)
+  )
+) %>%
+  arrange(desc(ROC_AUC))
+
+# Table
+model_results %>%
+  kable(caption = "Cross-Validated ROC-AUC by Model", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Plot
+model_results %>%
+  mutate(Model = fct_reorder(Model, ROC_AUC)) %>%
+  ggplot(aes(x = ROC_AUC, y = Model, fill = Model)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(ROC_AUC, 4)), hjust = -0.1, size = 3.5) +
+  scale_fill_manual(values = c("#2E86AB", "#5FA8D3", "#E84855", "#C1272D")) +
+  xlim(0, 1) +
+  labs(title = "Cross-Validated ROC-AUC by Model",
+       x = "ROC-AUC", y = NULL) +
+  theme_minimal()
+
+```
+
+The results fall clearly into two tiers. The two linear models, logistic regression and elastic net, perform almost equal, both getting a ROC-AUC of about **0.861**. The two tree-based models form a distinctly higher tier, with the random forest (**0.928**) and the boosted tree (**0.927**) essentially tied for the best performance. The roughly seven point gap between the linear and tree models show that the relationships in this data are more non linear flexible methods are far better suited to predicting them.
+
+The best two models fall on nearly the same score. This suggests predictive signal available in these features. Because the random forest and boosted tree are statistically indistinguishable here, the **random forest** will be forwarded to the test set, on the grounds that it is slightly simpler to interpret and less prone to overfitting than a sequentially boosted model.
+
+------------------------------------------------------------------------
+
+# Final Model: Test Set Evaluation
+
+Having selected the random forest as our best model, we now evaluate it on the testing set the 20% of bookings held out at the very beginning and never used during training or tuning. This is the moment of truth: performance here is our most honest estimate of how the model would do on new bookings. We use `last_fit()`, which fits the finalized model on the entire training set and then makes predictions on the test set in a single step.
+
+```{r final-fit, eval=FALSE}
+# workflow with best random forest hyperparameters
+best_rf <- select_best(rf_tune, metric = "roc_auc")
+
+final_rf_wf <- finalize_workflow(rf_wf, best_rf)
+
+# Fit on the full training set
+final_fit <- last_fit(final_rf_wf, hotel_split,
+                      metrics = metric_set(roc_auc, accuracy))
+
+save(final_fit, file = "final_fit.rda")
+
+```
+
+```{r}
+
+load("final_fit.rda")
+```
+
+## Performance Metrics
+
+```{r test-metrics}
+# collect_metrics(final_fit)
+collect_metrics(final_fit) %>%
+  kable(caption = "Final Model Performance on the Test Set", digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+```
+
+The held-out test, for the random forest achieved an ROC-AUC of 0.9315 and accuracy of 0.8637. The AUC slightly exceeded the CV estimate (0.928) which is an excellent sign. It suggests the model did not overfit and generalizes well to unseen data. The 86% accuracy is strong, since this data set had a class imbalance and does better than naive guessing of 63% accuracy (because of the 63% majority class).
+
+## ROC Curve
+
+```{r roc-curve}
+final_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = is_canceled, '.pred_Not Canceled') %>%
+  autoplot()
+```
+
+This is a classic ROC curve with the sharp bend to the top left corner. Far from the diagonal baseline. This represents the models strength in identifying canceled/non-canceled bookings. The high sensitivity is achieved with a relatively low false positive rate. The 0.9315 ROC_AUC would be the integrated area under the graph. The model assigns a cancellation to the true canceled 93% of the time.
+
+## Confusion Matrix
+
+```{r conf-matrix}
+final_fit %>%
+  collect_predictions() %>%
+  conf_mat(truth = is_canceled, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+The confusion matrix breaks down the model's predictions on the test set. Of the bookings that were actually canceled, the model correctly identified 6,571 and missed 2,274 (false negatives); of those that were honored, it correctly identified 14,053 and wrongly flagged 980 (false positives). The cancellation class is clearly the harder of the two to predict, expected, since cancellations are the minority class and are driven by unpredictable factors like last-minute changes in a guest's plans.
+
+These errors carry different costs. A false positive may lead a hotel to overbook and risk turning away a guest who actually arrives, while a false negative leaves a room unsold that could have been rebooked. The model's false positive rate is low (about 6.5%), so when it flags a booking as likely to cancel it is usually right. However, it still misses roughly 26% of true cancellations, a reminder that human behavior carries variation no model can fully capture.
+
+## Variable Importance
+
+```{r var-importance}
+final_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 15) +
+  labs(title = "Variable Importance — Final Random Forest") +
+  theme_minimal()
+```
+
+The variable importance plot confirms what our exploratory analysis suggested. By a clear margin, the two most important predictors are **`deposit_type_Non.Refund`** and **`lead_time`** precisely the variables we singled out during EDA. The dominance of the non-refundable deposit indicator reflects the striking near 100% cancellation rate we observed for those bookings, while the strength of lead time confirms our finding that reservations made far in advance are substantially more likely to be canceled.
+
+Below these, **`adr`** (price per night), **`total_of_special_requests`**, and **`previous_cancellations`** round out the top five. These too align with intuition: pricing affects a guest's commitment, guests who make special requests tend to be more invested in their stay (a negative relationship we noted in the correlation matrix), and a guest's own cancellation history is naturally predictive of future behavior.
+
+The remaining important features, length of stay, parking requests, market segment, and customer type, contribute smaller but meaningful signal. Overall, the model's notion of which variables matter is both interpretable and consistent with domain knowledge, which lends credibility to its predictions.
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+## Summary of Results
+
+Overall, the random forest was our best-performing model. It achieved a test ROC-AUC of **0.9315** and an accuracy of **0.864**, edging out the boosted tree and outperforming the two linear models, which plateaued around 0.861. Also, the random forest's test performance slightly exceeded its cross-validation estimate of \~0.928, indicating that the model generalized well and did not overfit.
+
+Admittedly, an even greater predictive power would have been ideal, but given the moderate class imbalance and the inherently unpredictable nature of cancellations which often hinge on last minute changes in a guest's plans. These results are strong. More importantly, the model did more than just predict: it provided clear, interpretable insight into *what drives* cancellations. Its most important features, non-refundable deposits, lead time, price, special requests, and a guest's prior cancellation history were consistent with the exploratory analysis and real-world application, which lends real credibility to its conclusions.
+
+## Limitations and Future Work
+
+This analysis has several limitations worth acknowledging. The most significant is the **age of the data**: the bookings span 2015–2017, nearly a decade old, and may not reflect today's travel behavior, pricing, or geopolitical and economic climate. A more modern dataset would make the model's conclusions far more actionable for a hotel operating now.
+
+A second limitation concerns our most important predictor. As noted earlier, the dominance of the non-refundable deposit indicator may reflect **how the data were recorded**, with non-refundable status possibly applied to bookings already flagged as cancellations, rather than genuine guest behavior. Some of the model's predictive strength could be a result of a data entry issue that would not generalize to a cleaner dataset.
+
+We also made simplifying choices that may have left predictive power on the table. We **dropped several variables with high levels**, `country`, `agent`, and `company`, to keep the model manageable. `Country` in particular likely carries real signal, since domestic and international guests probably cancel at different rates. Revisiting these variables, for instance by lumping rare countries into an "other" category rather than dropping them entirely, is a natural next step. Another issue would be trying to group countries into continents that would require more prep and coding management.
+
+**Computational cost** was a practical constraint throughout. Tuning the tree-based models took anywhere from thirty minutes to over an hour on a fast machine, which forced us to limit the size of our search grids. The best random forest and boosted tree both selected hyperparameter values at the edges of those grids, suggesting that a wider, and more expensive search might yield further gains but could lead to over fitting issues.
+
+Finally, the fundamental difficulty of this problem is that cancellations are driven by **human behavior**. People cancel for countless reasons, emergencies, changes of heart, or simple impulse, much of which is unpredictable from booking data alone. This places a natural bound on prediction that no model can fully overcome. Future work could push closer to that barrier by testing additional model types such as support vector machines or neural networks.
+
+------------------------------------------------------------------------
+
+# References
+
+Antonio, N., Almeida, A., & Nunes, L. (2019). Hotel booking demand datasets. *Data in Brief*, 22, 41–49. <https://doi.org/10.1016/j.dib.2018.11.126>
+
+James, G., Witten, D., Hastie, T., & Tibshirani, R. (2021). *An Introduction to Statistical Learning with Applications in R* (2nd ed.). Springer. <https://doi.org/10.1007/978-1-0716-1418-1>
+
+Mostipak, J. (2020). *Hotel booking demand* [Dataset]. Kaggle. <https://www.kaggle.com/datasets/jessemostipak/hotel-booking-demand>
+
+*Acknowledgments:* I used Anthropic's Claude (claude.ai) as an assistant for wordsmithing prose, clarifying statistical concepts, and locating R function and syntax references during this project. All modeling decisions, code execution, analysis, and interpretation are my own.
